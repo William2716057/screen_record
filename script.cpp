@@ -244,19 +244,14 @@ static void recordThreadProc()
  
     PostMessageW(g_hwnd, WM_RECORDING_DONE, ok ? 1 : 0, static_cast<LPARAM>(framesWritten));
 }
- 
-// ---------------------------------------------------------------------------
+
 // UI
-// ---------------------------------------------------------------------------
 static void setStatus(const std::wstring& text) { SetWindowTextW(g_lblStatus, text.c_str()); }
  
 static void startRecording()
 {
     if (g_recording.load()) return;
  
-    // A previous thread, if any, already posted WM_RECORDING_DONE and is
-    // finishing up — join it before starting a new one so it's never
-    // orphaned. This should return almost immediately.
     if (g_recordThread.joinable()) g_recordThread.join();
  
     g_stopRequested.store(false);
@@ -330,7 +325,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
- 
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 {
     enableDpiAwareness();
