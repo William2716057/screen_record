@@ -1,23 +1,35 @@
 
-//   g++ -O2 -std=c++17 -mwindows recorder_gui.cpp -o recorder_gui.exe -lgdi32 -luser32 -lwinmm
-// Build (MSVC):
-//   cl /O2 /EHsc /std:c++17 /SUBSYSTEM:WINDOWS recorder_gui.cpp user32.lib gdi32.lib winmm.lib
 
+
+
+
+//g++ -O2 -std=c++17 -mwindows -municode script2.cpp -o delete.exe -lgdi32 -luser32 -lwinmm
+// Requires ffmpeg.exe on PATH.
+ 
 #include <windows.h>
 #include <string>
 #include <sstream>
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <algorithm>
+#include <cstdio>
+#include <cwchar>
  
-//edit here
-constexpr int CAPTURE_X      = 0;
-constexpr int CAPTURE_Y      = 0;
-constexpr int CAPTURE_WIDTH  = 1920;
-constexpr int CAPTURE_HEIGHT = 1080;
-constexpr int FPS            = 60;
-constexpr int MAX_SECONDS    = 60;        // safety auto-stop even if Stop isn't clicked
-const wchar_t* OUT_FILE      = L"output.mp4";
+// Encode settings and the selection box's starting size/position (you can
+// drag it anywhere and resize it afterwards — these are just defaults).
+
+constexpr int FPS               = 60;
+constexpr int MAX_SECONDS       = 60;     //auto-stop even if Stop isn't clicked
+constexpr int DEFAULT_SEL_W     = 640;
+constexpr int DEFAULT_SEL_H     = 360;
+constexpr int MIN_SEL_W         = 40;     // smallest resize
+constexpr int MIN_SEL_H         = 40;
+constexpr int HANDLE_SIZE       = 10;     // edges
+const wchar_t* OUT_FILE         = L"output.mp4"; //change to user input
+constexpr COLORREF OVERLAY_KEY  = RGB(255, 0, 255);   // "transparent" colours
+constexpr COLORREF BORDER_COLOR = RGB(255, 90, 0);
+constexpr COLORREF HANDLE_COLOR = RGB(255, 255, 255);
  
 
 static std::atomic<bool>      g_recording{false};
@@ -26,11 +38,13 @@ static std::atomic<long long> g_framesWritten{0};
 static std::thread            g_recordThread;
  
 static HWND g_hwnd = nullptr, g_btnRecord = nullptr, g_btnStop = nullptr, g_lblStatus = nullptr;
+static HWND g_overlay = nullptr;
  
-constexpr int  IDC_RECORD        = 101;
-constexpr int  IDC_STOP          = 102;
-constexpr UINT WM_RECORDING_DONE = WM_APP + 1;   // wParam: 1=ok/0=failed, lParam: frame count
-constexpr UINT_PTR TIMER_ID_UI   = 1;
+constexpr int  IDC_RECORD          = 101;
+constexpr int  IDC_STOP            = 102;
+constexpr UINT WM_RECORDING_DONE   = WM_APP + 1;   // wParam: 1=ok/0=failed, lParam: frame count
+constexpr UINT WM_SELECTION_CHANGED = WM_APP + 2;  // sent by the overlay whenever its rect changes
+constexpr UINT_PTR TIMER_ID_UI     = 1;
  
 static void enableDpiAwareness()
 {
@@ -45,7 +59,6 @@ static void enableDpiAwareness()
     SetProcessDPIAware();
 }
  
-
 struct ScreenCapture {
     HDC     screenDC = nullptr;
     HDC     memDC    = nullptr;
@@ -55,12 +68,9 @@ struct ScreenCapture {
     int     width = 0, height = 0;
     int     originX = 0, originY = 0;
  
-    bool init()
+    bool init(int x, int y, int w, int h)
     {
-        originX = CAPTURE_X;
-        originY = CAPTURE_Y;
-        width   = CAPTURE_WIDTH;
-        height  = CAPTURE_HEIGHT;
+        originX = x; originY = y; width = w; height = h;
         if (width <= 0 || height <= 0) return false;
  
         screenDC = GetDC(nullptr);
@@ -120,16 +130,16 @@ struct ScreenCapture {
     }
 };
  
+
 struct FfmpegProcess {
-    HANDLE hProcess   = nullptr;
+    HANDLE hProcess    = nullptr;
     HANDLE hStdinWrite = nullptr;
  
     bool start(const std::wstring& outFile, int w, int h, int fps)
     {
         HANDLE readPipe = nullptr, writePipe = nullptr;
-        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };  // handles inheritable
+        SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
         if (!CreatePipe(&readPipe, &writePipe, &sa, 1 << 20)) return false;
-        // Only the read end should be inherited by ffmpeg; our write end must not be.
         SetHandleInformation(writePipe, HANDLE_FLAG_INHERIT, 0);
  
         std::wstringstream cmd;
@@ -142,26 +152,22 @@ struct FfmpegProcess {
                L" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p"
                L" -movflags +faststart"
                L" \"" << outFile << L"\"";
-        std::wstring cmdline = cmd.str();  // CreateProcessW needs a mutable buffer
+        std::wstring cmdline = cmd.str();
  
         STARTUPINFOW si{};
-        si.cb         = sizeof(si);
-        si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.cb          = sizeof(si);
+        si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
-        si.hStdInput  = readPipe;
-        si.hStdOutput = nullptr;
-        si.hStdError  = nullptr;
+        si.hStdInput   = readPipe;
+        si.hStdOutput  = nullptr;
+        si.hStdError   = nullptr;
  
         PROCESS_INFORMATION pi{};
         BOOL ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr,
-                                  /*bInheritHandles=*/TRUE, CREATE_NO_WINDOW,
-                                  nullptr, nullptr, &si, &pi);
+                                  TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
  
-        CloseHandle(readPipe);  // the child now owns its copy; parent's is done with it
-        if (!ok) {
-            CloseHandle(writePipe);
-            return false;
-        }
+        CloseHandle(readPipe);
+        if (!ok) { CloseHandle(writePipe); return false; }
         CloseHandle(pi.hThread);
         hProcess    = pi.hProcess;
         hStdinWrite = writePipe;
@@ -181,8 +187,6 @@ struct FfmpegProcess {
         return true;
     }
  
-    // Closing the write handle sends ffmpeg EOF on stdin, which lets it flush
-    // and finalise the MP4 (moov atom etc.) before the process exits.
     void finish()
     {
         if (hStdinWrite) { CloseHandle(hStdinWrite); hStdinWrite = nullptr; }
@@ -195,13 +199,13 @@ struct FfmpegProcess {
 };
  
 
-static void recordThreadProc()
+static void recordThreadProc(int x, int y, int w, int h)
 {
     ScreenCapture cap;
     long long framesWritten = 0;
     bool ok = true;
  
-    if (!cap.init()) ok = false;
+    if (!cap.init(x, y, w, h)) ok = false;
  
     FfmpegProcess enc;
     if (ok && !enc.start(OUT_FILE, cap.width, cap.height, FPS)) ok = false;
@@ -244,15 +248,211 @@ static void recordThreadProc()
  
     PostMessageW(g_hwnd, WM_RECORDING_DONE, ok ? 1 : 0, static_cast<LPARAM>(framesWritten));
 }
+ 
 
-// UI
+enum class HitZone { None, Move, TL, T, TR, R, BR, B, BL, L };
+ 
+static bool     g_dragging = false;
+static HitZone  g_dragZone = HitZone::None;
+static POINT    g_dragStartScreen{};
+static RECT     g_dragStartRect{};
+ 
+static HitZone hitTestOverlay(HWND hwnd)
+{
+    RECT rc; GetClientRect(hwnd, &rc);
+    POINT p; GetCursorPos(&p); ScreenToClient(hwnd, &p);
+ 
+    const bool nearLeft   = p.x <= HANDLE_SIZE;
+    const bool nearRight  = p.x >= rc.right - HANDLE_SIZE;
+    const bool nearTop    = p.y <= HANDLE_SIZE;
+    const bool nearBottom = p.y >= rc.bottom - HANDLE_SIZE;
+    const bool inside     = p.x >= 0 && p.y >= 0 && p.x <= rc.right && p.y <= rc.bottom;
+ 
+    if (nearLeft  && nearTop)    return HitZone::TL;
+    if (nearRight && nearTop)    return HitZone::TR;
+    if (nearLeft  && nearBottom) return HitZone::BL;
+    if (nearRight && nearBottom) return HitZone::BR;
+    if (nearTop)    return HitZone::T;
+    if (nearBottom) return HitZone::B;
+    if (nearLeft)   return HitZone::L;
+    if (nearRight)  return HitZone::R;
+    if (inside)     return HitZone::Move;
+    return HitZone::None;
+}
+ 
+static HCURSOR cursorForZone(HitZone z)
+{
+    switch (z) {
+    case HitZone::TL: case HitZone::BR: return LoadCursorW(nullptr, IDC_SIZENWSE);
+    case HitZone::TR: case HitZone::BL: return LoadCursorW(nullptr, IDC_SIZENESW);
+    case HitZone::L:  case HitZone::R:  return LoadCursorW(nullptr, IDC_SIZEWE);
+    case HitZone::T:  case HitZone::B:  return LoadCursorW(nullptr, IDC_SIZENS);
+    case HitZone::Move: return LoadCursorW(nullptr, IDC_SIZEALL);
+    default: return LoadCursorW(nullptr, IDC_ARROW);
+    }
+}
+ 
+static void notifyMainOfSelectionChange()
+{
+    PostMessageW(g_hwnd, WM_SELECTION_CHANGED, 0, 0);
+}
+ 
+static void paintOverlay(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT rc; GetClientRect(hwnd, &rc);
+ 
+    HBRUSH keyBrush = CreateSolidBrush(OVERLAY_KEY);
+    FillRect(hdc, &rc, keyBrush);
+    DeleteObject(keyBrush);
+ 
+    HBRUSH borderBrush = CreateSolidBrush(BORDER_COLOR);
+    constexpr int B = 3; // border thickness
+    RECT top{ rc.left, rc.top, rc.right, rc.top + B };
+    RECT bottom{ rc.left, rc.bottom - B, rc.right, rc.bottom };
+    RECT left{ rc.left, rc.top, rc.left + B, rc.bottom };
+    RECT right{ rc.right - B, rc.top, rc.right, rc.bottom };
+    FillRect(hdc, &top, borderBrush);
+    FillRect(hdc, &bottom, borderBrush);
+    FillRect(hdc, &left, borderBrush);
+    FillRect(hdc, &right, borderBrush);
+    DeleteObject(borderBrush);
+ 
+    HBRUSH handleBrush = CreateSolidBrush(HANDLE_COLOR);
+    auto drawHandle = [&](int cx, int cy) {
+        RECT h{ cx - HANDLE_SIZE / 2, cy - HANDLE_SIZE / 2, cx + HANDLE_SIZE / 2, cy + HANDLE_SIZE / 2 };
+        FillRect(hdc, &h, handleBrush);
+    };
+    drawHandle(rc.left, rc.top);
+    drawHandle(rc.right, rc.top);
+    drawHandle(rc.left, rc.bottom);
+    drawHandle(rc.right, rc.bottom);
+    drawHandle((rc.left + rc.right) / 2, rc.top);
+    drawHandle((rc.left + rc.right) / 2, rc.bottom);
+    drawHandle(rc.left, (rc.top + rc.bottom) / 2);
+    drawHandle(rc.right, (rc.top + rc.bottom) / 2);
+    DeleteObject(handleBrush);
+ 
+    // Size label, top-left, on an opaque backing so it isn't colour-keyed away.
+    wchar_t label[64];
+    swprintf_s(label, L" %d x %d ", static_cast<int>(rc.right - rc.left), static_cast<int>(rc.bottom - rc.top));
+    SIZE textSize;
+    HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, font));
+    GetTextExtentPoint32W(hdc, label, static_cast<int>(wcslen(label)), &textSize);
+    RECT labelRect{ rc.left + B, rc.top + B, rc.left + B + textSize.cx, rc.top + B + textSize.cy };
+    HBRUSH labelBg = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(hdc, &labelRect, labelBg);
+    DeleteObject(labelBg);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    SetBkMode(hdc, TRANSPARENT);
+    TextOutW(hdc, labelRect.left, labelRect.top, label, static_cast<int>(wcslen(label)));
+    SelectObject(hdc, oldFont);
+ 
+    EndPaint(hwnd, &ps);
+}
+ 
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_LBUTTONDOWN: {
+        HitZone zone = hitTestOverlay(hwnd);
+        if (zone != HitZone::None) {
+            g_dragging = true;
+            g_dragZone = zone;
+            GetCursorPos(&g_dragStartScreen);
+            GetWindowRect(hwnd, &g_dragStartRect);
+            SetCapture(hwnd);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (g_dragging) { g_dragging = false; g_dragZone = HitZone::None; ReleaseCapture(); }
+        return 0;
+ 
+    case WM_MOUSEMOVE:
+        if (g_dragging) {
+            POINT cur; GetCursorPos(&cur);
+            const int dx = cur.x - g_dragStartScreen.x;
+            const int dy = cur.y - g_dragStartScreen.y;
+            RECT r = g_dragStartRect;
+ 
+            switch (g_dragZone) {
+            case HitZone::Move:
+                r.left += dx; r.right += dx; r.top += dy; r.bottom += dy;
+                break;
+            case HitZone::TL: r.left += dx; r.top += dy; break;
+            case HitZone::TR: r.right += dx; r.top += dy; break;
+            case HitZone::BL: r.left += dx; r.bottom += dy; break;
+            case HitZone::BR: r.right += dx; r.bottom += dy; break;
+            case HitZone::T:  r.top += dy; break;
+            case HitZone::B:  r.bottom += dy; break;
+            case HitZone::L:  r.left += dx; break;
+            case HitZone::R:  r.right += dx; break;
+            default: break;
+            }
+ 
+            // Enforce a minimum size by pinning whichever edge is moving.
+            if (r.right - r.left < MIN_SEL_W) {
+                if (g_dragZone == HitZone::L || g_dragZone == HitZone::TL || g_dragZone == HitZone::BL)
+                    r.left = r.right - MIN_SEL_W;
+                else
+                    r.right = r.left + MIN_SEL_W;
+            }
+            if (r.bottom - r.top < MIN_SEL_H) {
+                if (g_dragZone == HitZone::T || g_dragZone == HitZone::TL || g_dragZone == HitZone::TR)
+                    r.top = r.bottom - MIN_SEL_H;
+                else
+                    r.bottom = r.top + MIN_SEL_H;
+            }
+ 
+            SetWindowPos(hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            notifyMainOfSelectionChange();
+        }
+        return 0;
+ 
+    case WM_SETCURSOR:
+        SetCursor(cursorForZone(g_dragging ? g_dragZone : hitTestOverlay(hwnd)));
+        return TRUE;
+ 
+    case WM_PAINT:
+        paintOverlay(hwnd);
+        return 0;
+ 
+    case WM_ERASEBKGND:
+        return 1;  // avoid a flash-paint with the default background before WM_PAINT
+ 
+    case WM_DESTROY:
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+ 
+// Main window
 static void setStatus(const std::wstring& text) { SetWindowTextW(g_lblStatus, text.c_str()); }
+ 
+static void updateStatusFromSelection()
+{
+    if (g_recording.load()) return; 
+    RECT r; GetWindowRect(g_overlay, &r);
+    std::wstringstream ss;
+    ss << L"Region: " << (r.right - r.left) << L" x " << (r.bottom - r.top)
+       << L" at (" << r.left << L", " << r.top << L")";
+    setStatus(ss.str());
+}
  
 static void startRecording()
 {
     if (g_recording.load()) return;
- 
     if (g_recordThread.joinable()) g_recordThread.join();
+ 
+    RECT r; GetWindowRect(g_overlay, &r);
+    const int x = r.left, y = r.top, w = r.right - r.left, h = r.bottom - r.top;
+ 
+    ShowWindow(g_overlay, SW_HIDE);   
  
     g_stopRequested.store(false);
     g_framesWritten.store(0);
@@ -263,7 +463,7 @@ static void startRecording()
     setStatus(L"Recording…");
     SetTimer(g_hwnd, TIMER_ID_UI, 250, nullptr);
  
-    g_recordThread = std::thread(recordThreadProc);
+    g_recordThread = std::thread(recordThreadProc, x, y, w, h);
 }
  
 static void stopRecording()
@@ -284,14 +484,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_btnStop = CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                    140, 20, 100, 32, hwnd, reinterpret_cast<HMENU>(IDC_STOP),
                                    nullptr, nullptr);
-        g_lblStatus = CreateWindowW(L"STATIC", L"Idle", WS_CHILD | WS_VISIBLE,
-                                     20, 66, 280, 24, hwnd, nullptr, nullptr, nullptr);
+        g_lblStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                     20, 66, 280, 40, hwnd, nullptr, nullptr, nullptr);
         EnableWindow(g_btnStop, FALSE);
         return 0;
  
     case WM_COMMAND:
         if (LOWORD(wParam) == IDC_RECORD) startRecording();
         else if (LOWORD(wParam) == IDC_STOP) stopRecording();
+        return 0;
+ 
+    case WM_SELECTION_CHANGED:
+        updateStatusFromSelection();
         return 0;
  
     case WM_TIMER:
@@ -307,6 +511,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_recording.store(false);
         EnableWindow(g_btnRecord, TRUE);
         EnableWindow(g_btnStop, FALSE);
+        ShowWindow(g_overlay, SW_SHOW);
  
         const bool      ok     = (wParam != 0);
         const long long frames = static_cast<long long>(lParam);
@@ -320,34 +525,57 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         if (g_recording.load()) g_stopRequested.store(true);
         if (g_recordThread.joinable()) g_recordThread.join();
+        if (g_overlay) DestroyWindow(g_overlay);
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
-
+ 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 {
     enableDpiAwareness();
  
-    const wchar_t* className = L"ScreenRecorderWindow";
+    // Main window
+    const wchar_t* mainClass = L"ScreenRecorderWindow";
     WNDCLASSW wc{};
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInstance;
-    wc.lpszClassName = className;
-    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = mainClass;
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     RegisterClassW(&wc);
  
-    g_hwnd = CreateWindowExW(0, className, L"Screen Recorder",
+    g_hwnd = CreateWindowExW(0, mainClass, L"Screen Recorder",
                               (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME),
-                              CW_USEDEFAULT, CW_USEDEFAULT, 320, 150,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 340, 160,
                               nullptr, nullptr, hInstance, nullptr);
     if (!g_hwnd) return 1;
- 
     ShowWindow(g_hwnd, nCmdShow);
     UpdateWindow(g_hwnd);
  
+    // Selection overlay — default position: just below the main window.
+    const wchar_t* overlayClass = L"ScreenRecorderSelectionOverlay";
+    WNDCLASSW oc{};
+    oc.lpfnWndProc   = OverlayWndProc;
+    oc.hInstance     = hInstance;
+    oc.lpszClassName = overlayClass;
+    oc.hCursor       = nullptr;  // cursor is set manually via WM_SETCURSOR
+    oc.hbrBackground = nullptr;
+    RegisterClassW(&oc);
+ 
+    RECT mainRect; GetWindowRect(g_hwnd, &mainRect);
+    const int selX = mainRect.left;
+    const int selY = mainRect.bottom + 20;
+ 
+    g_overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                                 overlayClass, L"",
+                                 WS_POPUP | WS_VISIBLE,
+                                 selX, selY, DEFAULT_SEL_W, DEFAULT_SEL_H,
+                                 nullptr, nullptr, hInstance, nullptr);
+    SetLayeredWindowAttributes(g_overlay, OVERLAY_KEY, 0, LWA_COLORKEY);
+    updateStatusFromSelection();
+
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
