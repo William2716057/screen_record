@@ -1,11 +1,6 @@
-
-
-
-
-
 //g++ -O2 -std=c++17 -mwindows -municode script2.cpp -o delete.exe -lgdi32 -luser32 -lwinmm
 // Requires ffmpeg.exe on PATH.
- 
+
 #include <windows.h>
 #include <string>
 #include <sstream>
@@ -15,12 +10,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <cwchar>
- 
+
 // Encode settings and the selection box's starting size/position (you can
 // drag it anywhere and resize it afterwards — these are just defaults).
 
 constexpr int FPS               = 60;
-constexpr int MAX_SECONDS       = 60;     //auto-stop even if Stop isn't clicked
+constexpr int MAX_SECONDS       = 60;     //auto-stop even if Stop isn't clicked (change to user input)
 constexpr int DEFAULT_SEL_W     = 640;
 constexpr int DEFAULT_SEL_H     = 360;
 constexpr int MIN_SEL_W         = 40;     // smallest resize
@@ -30,7 +25,7 @@ const wchar_t* OUT_FILE         = L"output.mp4"; //change to user input
 constexpr COLORREF OVERLAY_KEY  = RGB(255, 0, 255);   // "transparent" colours
 constexpr COLORREF BORDER_COLOR = RGB(255, 90, 0);
 constexpr COLORREF HANDLE_COLOR = RGB(255, 255, 255);
- 
+
 
 static std::atomic<bool>      g_recording{false};
 static std::atomic<bool>      g_stopRequested{false};
@@ -517,7 +512,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         const long long frames = static_cast<long long>(lParam);
         std::wstringstream ss;
         if (ok) ss << L"Saved " << frames << L" frames to " << OUT_FILE;
-        else    ss << L"Recording failed — is ffmpeg on PATH?";
+        else    ss << L"Recording failed - is ffmpeg off PATH? or other issue";
         setStatus(ss.str());
         return 0;
     }
@@ -554,7 +549,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
     ShowWindow(g_hwnd, nCmdShow);
     UpdateWindow(g_hwnd);
  
-    // Selection overlay — default position: just below the main window.
+    // Selection overlay - default position: just below the main window.
     const wchar_t* overlayClass = L"ScreenRecorderSelectionOverlay";
     WNDCLASSW oc{};
     oc.lpfnWndProc   = OverlayWndProc;
